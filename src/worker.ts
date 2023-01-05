@@ -78,7 +78,7 @@ export class Worker<TData = null> extends Base {
         : this.emit("job_finished", job);
     };
 
-    const promise = this.processor(job, progress)
+    const promise = this.processor(job as WithId<Job<TData>>, progress)
       .then(() => done())
       .catch((error) => done(error));
     return promise;

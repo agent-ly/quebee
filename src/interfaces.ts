@@ -1,14 +1,14 @@
-export type Job<TData = null> = {
+export type JobStatus = "pending" | "started" | "finished" | "failed";
+
+export type Job<TData = unknown> = {
   name: string;
-  data: TData;
+  data: TData | null;
+  progress: number | null;
   locked: Date | null;
   started: Date | null;
   finished: Date | null;
   failed: Date | null;
   error: string | null;
-  progress: number | null;
   created: Date;
   updated: Date;
 };
-
-export type JobStatus = "pending" | "started" | "finished" | "failed";

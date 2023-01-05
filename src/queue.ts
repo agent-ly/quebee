@@ -9,7 +9,7 @@ export type QueueOptions = {
   clientOptions: ClientOptions;
 };
 
-export class Queue<TData = null> extends Base {
+export class Queue<TData = unknown> extends Base {
   constructor(
     private readonly name: string,
     private readonly options: QueueOptions
@@ -25,16 +25,16 @@ export class Queue<TData = null> extends Base {
     await this.closeClient();
   }
 
-  async addJob(data: TData = null): Promise<ObjectId> {
+  async addJob(data?: TData): Promise<ObjectId> {
     const job: Job<TData> = {
       name: this.name,
-      data: data,
+      data: data ?? null,
+      progress: null,
+      error: null,
       locked: null,
       started: null,
       finished: null,
       failed: null,
-      error: null,
-      progress: null,
       created: new Date(),
       updated: new Date(),
     };
@@ -62,12 +62,15 @@ export class Queue<TData = null> extends Base {
     return jobIds;
   }
 
-  findJob(filter: Filter<Job>): Promise<WithId<Job<TData>>[]> {
-    return this.collection.find({ name: this.name, ...filter }).toArray();
+  async findJobs(filter: Filter<Job>): Promise<WithId<Job<TData>>[]> {
+    const jobs = await this.collection
+      .find({ name: this.name, ...filter })
+      .toArray();
+    return jobs as WithId<Job<TData>>[];
   }
 
-  findJobByStatus(status: JobStatus): Promise<WithId<Job<TData>>[]> {
-    return this.findJob(this.getStatusFilter(status));
+  async findJobsByStatus(status: JobStatus): Promise<WithId<Job<TData>>[]> {
+    return this.findJobs(this.getStatusFilter(status));
   }
 
   countJobsByStatus(status: JobStatus): Promise<number> {
@@ -92,7 +95,7 @@ export class Queue<TData = null> extends Base {
   ): Promise<WithId<Job<TData>> | null> {
     if (typeof jobId === "string") jobId = new ObjectId(jobId);
     const job = await this.collection.findOne({ _id: jobId, name: this.name });
-    return job;
+    return job as WithId<Job<TData>>;
   }
 
   async removeJobById(jobId: string | ObjectId): Promise<void> {
