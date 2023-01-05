@@ -17,49 +17,26 @@ export class Queue<TData = unknown> extends Base {
     super(options.clientOptions);
   }
 
-  async start(): Promise<void> {
-    await this.connectClient();
-  }
-
-  async stop(): Promise<void> {
-    await this.closeClient();
-  }
-
   async addJob(data?: TData): Promise<ObjectId> {
-    const job: Job<TData> = {
-      name: this.name,
-      data: data ?? null,
-      progress: null,
-      error: null,
-      locked: null,
-      started: null,
-      finished: null,
-      failed: null,
-      created: new Date(),
-      updated: new Date(),
-    };
+    const job = this.buildJobSekeleton(data);
     const { insertedId: jobId } = await this.collection.insertOne(job as Job);
     this.emit("job_added", jobId);
     return jobId;
   }
 
-  async addJobs(data: TData[]): Promise<ObjectId[]> {
-    const jobs = data.map((data) => ({
-      name: this.name,
-      data: data,
-      locked: null,
-      started: null,
-      finished: null,
-      failed: null,
-      error: null,
-      progress: null,
-      created: new Date(),
-      updated: new Date(),
-    }));
-    const { insertedIds } = await this.collection.insertMany(jobs as Job[]);
-    const jobIds = Object.values(insertedIds) as ObjectId[];
-    for (const jobId of jobIds) this.emit("job_added", jobId as ObjectId);
-    return jobIds;
+  async scheduleJob(date: Date, data?: TData): Promise<ObjectId> {
+    const job = this.buildJobSekeleton(data, date);
+    const { insertedId: jobId } = await this.collection.insertOne(job as Job);
+    this.emit("job_added", jobId);
+    return jobId;
+  }
+
+  async repeatJob(every: number, data?: TData): Promise<ObjectId> {
+    const date = new Date(Date.now() + every);
+    const job = this.buildJobSekeleton(data, date, every);
+    const { insertedId: jobId } = await this.collection.insertOne(job as Job);
+    this.emit("job_added", jobId);
+    return jobId;
   }
 
   async findJobs(filter: Filter<Job>): Promise<WithId<Job<TData>>[]> {
@@ -127,5 +104,26 @@ export class Queue<TData = unknown> extends Base {
       case "failed":
         return { failed: { $ne: null } };
     }
+  }
+
+  private buildJobSekeleton(
+    data?: TData,
+    next?: Date,
+    every?: number
+  ): Job<TData> {
+    return {
+      name: this.name,
+      data: data ?? null,
+      ...(next ? { next: next } : {}),
+      ...(every ? { last: null, every: every, runs: 0, fails: 0 } : {}),
+      progress: null,
+      locked: null,
+      started: null,
+      finished: null,
+      failed: null,
+      error: null,
+      created: new Date(),
+      updated: new Date(),
+    };
   }
 }

@@ -20,13 +20,13 @@ export class Base extends EventEmitter {
     this.collectionName = options.collectionName;
   }
 
-  protected async connectClient(): Promise<void> {
+  async connect(): Promise<void> {
     await this.client.connect();
     this.collection = this.client.db().collection(this.collectionName);
     this.emit("client_connected");
   }
 
-  protected async closeClient(): Promise<void> {
+  async close(): Promise<void> {
     await this.client.close();
     this.emit("client_closed");
   }

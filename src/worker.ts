@@ -31,7 +31,7 @@ export class Worker<TData = null> extends Base {
   }
 
   async start(): Promise<void> {
-    await this.connectClient();
+    await this.connect();
     await this.run();
   }
 
@@ -39,7 +39,7 @@ export class Worker<TData = null> extends Base {
     if (!this.stopping)
       this.stopping = new Promise(async (resolve) => {
         await Promise.all([...this.processing]);
-        await this.closeClient();
+        await this.close();
         resolve();
       });
     return this.stopping;
@@ -54,28 +54,40 @@ export class Worker<TData = null> extends Base {
       await this.sleep();
     }
     this.running = false;
+    return void Promise.all([...this.processing]);
   }
 
-  async processJob(job: WithId<Job>): Promise<void> {
+  async processJob(job: WithId<Job>): Promise<WithId<Job> | null> {
+    if (job.next) job.next = null;
     job.started = new Date();
     job.updated = new Date();
     await this.saveJob(job);
     this.emit("job_started", job);
 
     const progress = () => this.progressJob(job);
-    const done = async (error?: Error) => {
+    const done = async (error?: unknown): Promise<WithId<Job> | null> => {
+      job.locked = null;
       if (error) {
-        job.error = error.message;
+        job.error = (error as Error).message;
         job.failed = new Date();
         job.updated = new Date();
       } else {
         job.finished = new Date();
         job.updated = new Date();
       }
+      if (job.every) {
+        if (error) job.fails = (job.fails ?? 0) + 1;
+        else job.runs = (job.runs ?? 0) + 1;
+        job.next = new Date(Date.now() + job.every);
+        job.last = job.finished;
+        job.started = null;
+        job.finished = null;
+      }
       await this.saveJob(job);
       error
         ? this.emit("job_failed", error, job)
         : this.emit("job_finished", job);
+      return error ? null : this.getNextJob();
     };
 
     const promise = this.processor(job as WithId<Job<TData>>, progress)
@@ -89,19 +101,15 @@ export class Worker<TData = null> extends Base {
     job.updated = new Date();
     const { modifiedCount } = await this.saveJob(job, { locked: null });
     if (modifiedCount === 0) return false;
-    this.emit("job_locked", job);
     return true;
   }
 
-  async progressJob(
-    job: WithId<Job>,
-    progress: number | null = null
-  ): Promise<void> {
-    job.progress = progress;
+  async progressJob(job: WithId<Job>, progress?: number): Promise<void> {
+    if (progress !== undefined) job.progress = progress;
     job.locked = new Date();
     job.updated = new Date();
     await this.saveJob(job);
-    this.emit("job_progress", job);
+    if (progress !== undefined) this.emit("job_progress", job);
   }
 
   async updateJobLocks(): Promise<void> {
@@ -110,7 +118,7 @@ export class Worker<TData = null> extends Base {
     const update: UpdateFilter<Job> = {
       $set: { locked: null, updated: new Date() },
     };
-    await this.collection.updateMany(filter, update);
+    return void this.collection.updateMany(filter, update);
   }
 
   async getNextJob(): Promise<WithId<Job> | null> {
@@ -122,7 +130,22 @@ export class Worker<TData = null> extends Base {
       failed: null,
     };
     if (this.options.ignoreStartedJobs) filter.started = null;
-    return this.collection.findOne(filter);
+    const cursor = this.collection.find(filter).sort({ created: 1 });
+    for await (const job of cursor) {
+      if (job.next && job.next > new Date()) continue;
+      return job;
+    }
+    return null;
+  }
+
+  private saveJob(
+    job: WithId<Job>,
+    extraFilters?: Filter<Job>
+  ): Promise<UpdateResult> {
+    return this.collection.updateOne(
+      { _id: job._id, ...extraFilters },
+      { $set: job }
+    );
   }
 
   private async process(): Promise<void> {
@@ -137,26 +160,16 @@ export class Worker<TData = null> extends Base {
         promises.map((promise, i) => promise.then(() => i))
       );
       const promise = promises[index];
-      const job = await promise;
-      if (job) {
-        const locked = await this.lockJob(job);
-        if (locked) this.processing.add(this.processJob(job));
-      }
       this.processing.delete(promise);
+      const job = await promise;
+      if (!job) return;
+      const locked = await this.lockJob(job);
+      if (!locked) return;
+      this.processing.add(this.processJob(job));
     } catch (error) {
       this.running = false;
       throw error;
     }
-  }
-
-  private saveJob(
-    job: WithId<Job>,
-    extraFilters?: Filter<Job>
-  ): Promise<UpdateResult> {
-    return this.collection.updateOne(
-      { _id: job._id, ...extraFilters },
-      { $set: job }
-    );
   }
 
   private sleep(): Promise<void> {
