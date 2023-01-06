@@ -1,5 +1,5 @@
 {
-    "name": "queuebee",
+    "name": "quebee",
     "version": "1.0.0",
     "type": "module",
     "exports": {
@@ -20,15 +20,20 @@
         "prepack": "unbuild",
         "release": "standard-version && git push --follow-tags && pnpm publish"
     },
+    "dependencies": {
+        "nanoid": "^4.0.0"
+    },
+    "peerDependencies": {
+        "mongodb": "^4.13.0"
+    },
     "devDependencies": {
         "@types/node": "^18.11.18",
+        "bullmq": "^3.5.2",
         "mongodb": "^4.13.0",
+        "redis": "^4.5.1",
         "standard-version": "^9.5.0",
         "ts-node": "^10.9.1",
         "typescript": "^4.9.4",
         "unbuild": "^1.0.2"
-    },
-    "peerDependencies": {
-        "mongodb": "^4.13.0"
     }
 }

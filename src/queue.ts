@@ -1,123 +1,69 @@
-import type { Filter, WithId } from "mongodb";
-import { ObjectId } from "mongodb";
+import type { QueueOptions } from "./option-interfaces.js";
+import type { Job, JobQueue } from "./job-interfaces.js";
 
-import type { ClientOptions } from "./base.js";
 import { Base } from "./base.js";
-import { Job, JobStatus } from "./interfaces.js";
 
-export type QueueOptions = {
-  clientOptions: ClientOptions;
-};
-
-export class Queue<TData = unknown> extends Base {
+export class Queue<TData = unknown> extends Base<TData> {
   constructor(
-    private readonly name: string,
+    public readonly name: string,
     private readonly options: QueueOptions
   ) {
-    super(options.clientOptions);
+    super(
+      name,
+      options.clientOptions.url,
+      options.clientOptions.collectionName
+    );
   }
 
-  async addJob(data?: TData): Promise<ObjectId> {
-    const job = this.buildJobSekeleton(data);
-    const { insertedId: jobId } = await this.collection.insertOne(job as Job);
-    this.emit("job_added", jobId);
-    return jobId;
-  }
-
-  async scheduleJob(date: Date, data?: TData): Promise<ObjectId> {
-    const job = this.buildJobSekeleton(data, date);
-    const { insertedId: jobId } = await this.collection.insertOne(job as Job);
-    this.emit("job_added", jobId);
-    return jobId;
-  }
-
-  async repeatJob(every: number, data?: TData): Promise<ObjectId> {
-    const date = new Date(Date.now() + every);
-    const job = this.buildJobSekeleton(data, date, every);
-    const { insertedId: jobId } = await this.collection.insertOne(job as Job);
-    this.emit("job_added", jobId);
-    return jobId;
-  }
-
-  async findJobs(filter: Filter<Job>): Promise<WithId<Job<TData>>[]> {
-    const jobs = await this.collection
-      .find({ name: this.name, ...filter })
-      .toArray();
-    return jobs as WithId<Job<TData>>[];
-  }
-
-  async findJobsByStatus(status: JobStatus): Promise<WithId<Job<TData>>[]> {
-    return this.findJobs(this.getStatusFilter(status));
-  }
-
-  countJobsByStatus(status: JobStatus): Promise<number> {
-    return this.collection.countDocuments({
+  async start(): Promise<void> {
+    const queue = await this.queuesCollection.countDocuments({
       name: this.name,
-      ...this.getStatusFilter(status),
     });
-  }
-
-  async removeJobsByStatus(
-    status: "pending" | "finished" | "failed"
-  ): Promise<number> {
-    const { deletedCount } = await this.collection.deleteMany({
-      name: this.name,
-      ...this.getStatusFilter(status),
-    });
-    return deletedCount;
-  }
-
-  async findJobById(
-    jobId: string | ObjectId
-  ): Promise<WithId<Job<TData>> | null> {
-    if (typeof jobId === "string") jobId = new ObjectId(jobId);
-    const job = await this.collection.findOne({ _id: jobId, name: this.name });
-    return job as WithId<Job<TData>>;
-  }
-
-  async removeJobById(jobId: string | ObjectId): Promise<void> {
-    if (typeof jobId === "string") jobId = new ObjectId(jobId);
-    const { deletedCount } = await this.collection.deleteOne({
-      _id: jobId,
-      started: null,
-    });
-    if (deletedCount === 0) throw new Error("Job not found or already started");
-  }
-
-  async getJobStatusById(jobId: string | ObjectId): Promise<JobStatus> {
-    const job = await this.findJobById(jobId);
-    if (!job) throw new Error("Job not found");
-    if (job.failed) return "failed";
-    if (job.finished) return "finished";
-    if (job.started) return "started";
-    return "pending";
-  }
-
-  private getStatusFilter(status: JobStatus) {
-    switch (status) {
-      case "pending":
-        return { started: null };
-      case "started":
-        return { started: { $ne: null }, finished: null, failed: null };
-      case "finished":
-        return { finished: { $ne: null } };
-      case "failed":
-        return { failed: { $ne: null } };
+    if (!queue) {
+      await this.queuesCollection.insertOne({
+        name: this.name,
+        counter: 0,
+        stalled: [],
+        started: [],
+        finished: [],
+        failed: [],
+        pending: [],
+        locks: [],
+        jobs: [],
+      });
     }
   }
 
-  private buildJobSekeleton(
-    data?: TData,
-    next?: Date,
-    every?: number
-  ): Job<TData> {
+  async addJob(name: string, data?: TData): Promise<number> {
+    const result = await this.queuesCollection.findOneAndUpdate(
+      {
+        name: this.name,
+      },
+      {
+        $inc: { counter: 1 },
+      },
+      { returnDocument: "after" }
+    );
+    if (!result.value) throw new Error(`Queue ${this.name} not found`);
+    const nextId = result.value.counter;
+    const job = this.buildJob(nextId, name, data);
+    return this.insertJob(job);
+  }
+
+  private async insertJob(job: Job<TData>): Promise<number> {
+    await this.queuesCollection.updateOne(
+      { name: this.name },
+      { $push: { pending: job.id, jobs: job } }
+    );
+    return job.id;
+  }
+
+  private buildJob(id: number, name: string, data?: TData): Job<TData> {
     return {
-      name: this.name,
+      id,
+      name,
       data: data ?? null,
-      ...(next ? { next: next } : {}),
-      ...(every ? { last: null, every: every, runs: 0, fails: 0 } : {}),
       progress: null,
-      locked: null,
       started: null,
       finished: null,
       failed: null,

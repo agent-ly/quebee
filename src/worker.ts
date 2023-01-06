@@ -1,33 +1,39 @@
-import type { Filter, UpdateFilter, UpdateResult, WithId } from "mongodb";
+import type { UpdateResult, WithId } from "mongodb";
+import { nanoid } from "nanoid";
 
-import type { Job } from "./interfaces.js";
-import type { ClientOptions } from "./base.js";
+import type { Job } from "./job-interfaces.js";
+import type { WorkerOptions } from "./option-interfaces.js";
+
 import { Base } from "./base.js";
+import { delay } from "./util.js";
+import { Timers } from "./timers.js";
 
-export type WorkerOptions = {
-  concurrency: number;
-  processInterval: number;
-  lockLifetime: number;
-  ignoreStartedJobs: boolean;
-  clientOptions: ClientOptions;
-};
+type JobOrNone = Job | null;
 
 export type ProcessorFunction<TData = null> = (
-  job: WithId<Job<TData>>,
+  job: Job<TData>,
   progress: () => Promise<void>
 ) => Promise<void>;
 
 export class Worker<TData = null> extends Base {
+  private id = nanoid();
   private running = false;
+  private drained = false;
+  private waiting = false;
+  private timers = new Timers();
   private stopping: Promise<void> | null = null;
-  private processing: Set<Promise<WithId<Job> | null | void>> = new Set();
+  private processing: Map<Promise<JobOrNone>, string> = new Map();
 
   constructor(
-    private readonly name: string,
+    public readonly name: string,
     private readonly options: WorkerOptions,
     private readonly processor: ProcessorFunction<TData>
   ) {
-    super(options.clientOptions);
+    super(
+      name,
+      options.clientOptions.url,
+      options.clientOptions.collectionName
+    );
   }
 
   async start(): Promise<void> {
@@ -38,7 +44,8 @@ export class Worker<TData = null> extends Base {
   stop(): Promise<void> {
     if (!this.stopping)
       this.stopping = new Promise(async (resolve) => {
-        await Promise.all([...this.processing]);
+        this.timers.clear();
+        await Promise.all([...this.processing.keys()]);
         await this.close();
         resolve();
       });
@@ -49,132 +56,231 @@ export class Worker<TData = null> extends Base {
     if (this.running) throw new Error("Worker is already running");
     if (this.stopping) throw new Error("Worker is stopping");
     this.running = true;
+    this.checkStalledJobs();
+    let counter = 0;
     while (!this.stopping) {
+      if (!this.waiting && this.processing.size < this.options.concurrency) {
+        const token = `${this.id}-${counter++}`;
+        this.processing.set(this.getNextJob(), token);
+      }
       await this.process();
-      await this.sleep();
     }
     this.running = false;
-    return void Promise.all([...this.processing]);
+    await Promise.all([...this.processing.keys()]);
   }
 
-  async processJob(job: WithId<Job>): Promise<WithId<Job> | null> {
-    if (job.next) job.next = null;
-    job.started = new Date();
-    job.updated = new Date();
-    await this.saveJob(job);
-    this.emit("job_started", job);
+  // Job Functions
 
-    const progress = () => this.progressJob(job);
-    const done = async (error?: unknown): Promise<WithId<Job> | null> => {
-      job.locked = null;
-      if (error) {
-        job.error = (error as Error).message;
-        job.failed = new Date();
-        job.updated = new Date();
+  private async processJob(
+    job: Job,
+    fetchNextCallback: () => boolean
+  ): Promise<JobOrNone> {
+    const locked = await this.lockJob(job);
+    if (!locked) return null;
+    let lockTimer: string;
+    let isTimerStopped = false;
+    const startRenewal = () => {
+      lockTimer = this.timers.set(
+        "renewJobLock",
+        this.options.lockRenewal,
+        async () => {
+          try {
+            if (isTimerStopped) return;
+            if (!(await this.renewJobLock(job))) return;
+            startRenewal();
+          } catch (error) {
+            console.error(`Error renewing lock for job ${job.id}: ${error}`);
+          }
+        }
+      );
+    };
+    const stopRenewal = () => {
+      isTimerStopped = true;
+      this.timers.delete(lockTimer);
+      this.unlockJob(job).catch((error) =>
+        console.error(`Error unlocking job ${job.id}: ${error}`)
+      );
+    };
+
+    const handleFinished = async () => {
+      job.finished = new Date();
+      job.updated = new Date();
+      await this.updateQueue({ $pull: { started: job.id } });
+      if (!this.options.removeOnFinished) {
+        await this.updateQueue({ $push: { finished: job.id } });
+        await this.saveJob(job);
       } else {
-        job.finished = new Date();
-        job.updated = new Date();
+        await this.removeJob(job);
       }
-      if (job.every) {
-        if (error) job.fails = (job.fails ?? 0) + 1;
-        else job.runs = (job.runs ?? 0) + 1;
-        job.next = new Date(Date.now() + job.every);
-        job.last = job.finished;
-        job.started = null;
-        job.finished = null;
+      this.emit("finished", job);
+      if (!fetchNextCallback()) return null;
+      return this.findNextJob();
+    };
+    const handleFailed = async (error: unknown) => {
+      job.error = (error as Error).message;
+      job.failed = new Date();
+      job.updated = new Date();
+      await this.updateQueue({ $pull: { started: job.id } });
+      if (!this.options.removeOnFailed) {
+        await this.updateQueue({ $push: { failed: job.id } });
+        await this.saveJob(job);
+      } else {
+        await this.removeJob(job);
       }
-      await this.saveJob(job);
-      error
-        ? this.emit("job_failed", error, job)
-        : this.emit("job_finished", job);
-      return error ? null : this.getNextJob();
+      this.emit("failed", error, job);
+      return null;
     };
 
-    const promise = this.processor(job as WithId<Job<TData>>, progress)
-      .then(() => done())
-      .catch((error) => done(error));
-    return promise;
+    try {
+      job.started = new Date();
+      job.updated = new Date();
+      await this.saveJob(job);
+      this.emit("started", job);
+      startRenewal();
+      const updateProgress = () => this.progressJob(job);
+      await this.processor(job as WithId<Job<TData>>, updateProgress);
+      return handleFinished();
+    } catch (error) {
+      return handleFailed(error);
+    } finally {
+      stopRenewal();
+    }
   }
 
-  async lockJob(job: WithId<Job>): Promise<boolean> {
-    job.locked = new Date();
-    job.updated = new Date();
-    const { modifiedCount } = await this.saveJob(job, { locked: null });
-    if (modifiedCount === 0) return false;
-    return true;
+  private async lockJob(job: Job): Promise<boolean> {
+    const lock = { id: job.id, expires: new Date() };
+    const { modifiedCount } = await this.updateQueue(
+      { $addToSet: { locks: lock } },
+      { "locks.id": { $ne: job.id } }
+    );
+    return modifiedCount === 1;
   }
 
-  async progressJob(job: WithId<Job>, progress?: number): Promise<void> {
+  private async unlockJob(job: Job): Promise<boolean> {
+    const { modifiedCount } = await this.updateQueue(
+      { $pull: { locks: { id: job.id } } },
+      { "locks.id": job.id }
+    );
+    return modifiedCount === 1;
+  }
+
+  private async renewJobLock(job: Job): Promise<boolean> {
+    const { modifiedCount } = await this.updateQueue(
+      { $set: { "locks.$.expires": new Date() } },
+      { "locks.id": job.id }
+    );
+    return modifiedCount === 1;
+  }
+
+  private async progressJob(job: Job, progress?: number): Promise<void> {
     if (progress !== undefined) job.progress = progress;
-    job.locked = new Date();
     job.updated = new Date();
     await this.saveJob(job);
-    if (progress !== undefined) this.emit("job_progress", job);
+    if (progress !== undefined) this.emit("progress", job);
   }
 
-  async updateJobLocks(): Promise<void> {
-    const threshold = new Date(Date.now() - this.options.lockLifetime);
-    const filter: Filter<Job> = { locked: { $lt: threshold } };
-    const update: UpdateFilter<Job> = {
-      $set: { locked: null, updated: new Date() },
-    };
-    return void this.collection.updateMany(filter, update);
+  private removeJob(job: Job): Promise<UpdateResult> {
+    return this.updateQueue(
+      { $pull: { "jobs.id": job.id } },
+      { "jobs.id": job.id }
+    );
   }
 
-  async getNextJob(): Promise<WithId<Job> | null> {
+  private saveJob(job: Job): Promise<UpdateResult> {
+    return this.updateQueue({ $set: { "jobs.$": job } }, { "jobs.id": job.id });
+  }
+
+  // Processor Functions
+
+  private async process(): Promise<void> {
+    const promises = [...this.processing.keys()];
+    const index = await Promise.race(
+      promises.map((promise, i) => promise.then(() => i))
+    );
+    const promise = promises[index];
+    const job = await promise;
+    if (job) {
+      const token = this.processing.get(promise);
+      if (!token) throw new Error(`Token not found for job ${job.id}`);
+      this.processing.set(
+        this.processJob(
+          job,
+          () => this.processing.size <= this.options.concurrency
+        ),
+        token
+      );
+    }
+    this.processing.delete(promise);
+  }
+
+  private async getNextJob(): Promise<JobOrNone> {
     if (this.stopping) return null;
-    const filter: Filter<Job> = {
-      name: this.name,
-      locked: null,
-      finished: null,
-      failed: null,
-    };
-    if (this.options.ignoreStartedJobs) filter.started = null;
-    const cursor = this.collection.find(filter).sort({ created: 1 });
-    for await (const job of cursor) {
-      if (job.next && job.next > new Date()) continue;
+    if (this.drained) {
+      this.waiting = true;
+      await delay(this.options.drainDelay);
+    }
+    const job = await this.findNextJob();
+    this.waiting = false;
+    return job;
+  }
+
+  private async findNextJob(): Promise<JobOrNone> {
+    const nextJobId = await this.findNextJobId();
+    return this.findNextJobFromId(nextJobId ?? null);
+  }
+
+  // All the below functions could be possibly be improved
+
+  private async findNextJobId(): Promise<number | null> {
+    const queue = await this.findAndUpdateQueue(
+      { $pop: { pending: -1 } },
+      { returnDocument: "before" }
+    );
+    return queue.pending[0] ?? null;
+  }
+
+  private async findNextJobFromId(jobId: number | null): Promise<JobOrNone> {
+    if (!jobId) {
+      if (!this.drained) {
+        this.drained = true;
+        this.emit("drained", this.options.drainDelay);
+      }
+    } else {
+      this.drained = false;
+      const queue = await this.findAndUpdateQueue(
+        { $addToSet: { started: jobId } },
+        { returnDocument: "after" },
+        { name: this.name, "jobs.id": jobId }
+      );
+      if (!queue.started.includes(jobId)) return null;
+      const job = queue.jobs.find((job) => job.id === jobId);
+      if (!job) throw new Error(`Job ${jobId} not found`);
       return job;
     }
     return null;
   }
 
-  private saveJob(
-    job: WithId<Job>,
-    extraFilters?: Filter<Job>
-  ): Promise<UpdateResult> {
-    return this.collection.updateOne(
-      { _id: job._id, ...extraFilters },
-      { $set: job }
+  private async checkStalledJobs(): Promise<void> {
+    if (this.stopping) return;
+    await this.requeueStalledJobs();
+    this.timers.set("checkStalledJobs", this.options.stalledInterval, () =>
+      this.checkStalledJobs()
     );
   }
 
-  private async process(): Promise<void> {
-    try {
-      await this.updateJobLocks();
-      if (this.processing.size < this.options.concurrency)
-        this.processing.add(this.getNextJob());
-      // We do this to get the reference to the promise that resolved
-      // So we can later remove it from the set
-      const promises = [...this.processing];
-      const index = await Promise.race(
-        promises.map((promise, i) => promise.then(() => i))
-      );
-      const promise = promises[index];
-      this.processing.delete(promise);
-      const job = await promise;
-      if (!job) return;
-      const locked = await this.lockJob(job);
-      if (!locked) return;
-      this.processing.add(this.processJob(job));
-    } catch (error) {
-      this.running = false;
-      throw error;
-    }
-  }
-
-  private sleep(): Promise<void> {
-    return new Promise((resolve) =>
-      setTimeout(resolve, this.options.processInterval)
+  private async requeueStalledJobs(): Promise<void> {
+    const queue = await this.findAndUpdateQueue(
+      { $pull: { locks: { expires: { $lt: new Date() } } } },
+      { returnDocument: "after" },
+      { name: this.name, "locks.expires": { $lt: new Date() } }
     );
+    const stalledStartedJobs = queue.started.filter(
+      (jobId) => !queue.locks.some((lock) => lock.id === jobId)
+    );
+    if (stalledStartedJobs.length === 0) return;
+    await this.updateQueue({
+      $pull: { started: { $in: stalledStartedJobs } },
+      $push: { waiting: { $each: stalledStartedJobs } },
+    });
   }
 }
